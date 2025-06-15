@@ -139,99 +139,87 @@ def stream_output(output_stream):
     return "".join(output_text)
     
 def get_node_output(current_node, fn_inputs, tokenizer, model, model_name, do_tasks, args, return_conv=False):
-
-    from fastchat.conversation import get_conv_template
-    from fastchat.model.model_adapter import (
-        get_conversation_template,
-        get_generate_stream_function,
-    )
-
-    from fastchat.utils import get_context_length
-
-    model_path = model_name
-    generate_stream_func = get_generate_stream_function(model, model_name)
     model_type = str(type(model)).lower()
     is_t5 = "t5" in model_type
     is_codet5p = "codet5p" in model_type
     repetition_penalty = args.repetition_penalty
 
-    # Hardcode T5's default repetition penalty to be 1.2
+    # Adjust T5's default penalty
     if is_t5 and repetition_penalty == 1.0:
         repetition_penalty = 1.2
 
-    context_len = get_context_length(model.config)
+    # Handle list of nodes
+    if isinstance(current_node, list):
+        return [
+            get_node_output(current_node[node_index], fn_inputs, tokenizer, model, model_name, do_tasks, args)
+            if do_tasks[node_index] else -1
+            for node_index in range(len(current_node))
+        ]
 
-    if type(current_node)==list:
-        return [get_node_output(current_node[node_index], fn_inputs, tokenizer, model, model_name, do_tasks, args) if do_tasks[node_index] else -1 for node_index in range(len(current_node)) ]
-    if type(current_node)==Node:
-        def new_chat():
-            if args.conv_template:
-                conv = get_conv_template(args.conv_template)
-            else:
-                conv = get_conversation_template(model_path)
-            system_message="A chat between a radiologist and an artificial intelligence assistant trained to understand radiology reports and any synonyms and word equivalency of findings and medical terms that may appear in the report. The assistant gives helpful structured answers to the radiologist.",
-            conv.set_system_message(system_message)
-            conv.messages = conv.messages[:0]
-            return conv
-        if 'conv_input' in fn_inputs:
-            conv = fn_inputs['conv_input']
-        else:
-            conv = new_chat()
-        
+    # Handle a single node
+    if isinstance(current_node, Node):
+        chat_history = []
+
         for prompt_index in range(len(current_node.data)):
-            
-            inp =f"{current_node.data[prompt_index](report_ = fn_inputs['report_'], sentence_ = fn_inputs['sentence_'], label_ = fn_inputs['label_'])}"
-            if len(inp)==0:
-                conv.append_message(conv.roles[1], fn_inputs['sentence_'])
-            else:
-                conv.append_message(conv.roles[0], inp)
-                conv.append_message(conv.roles[1], None)
-            
-                prompt = conv.get_prompt()
-                
-                if is_codet5p:  # codet5p is a code completion model.
-                    prompt = inp
-                gen_params = {
-                    "model": model_name,
-                    "prompt": prompt,
-                    "temperature": args.temperature,
-                    "repetition_penalty": repetition_penalty,
-                    "max_new_tokens": current_node.max_new_tokens[prompt_index],
-                    "stop": conv.stop_str,
-                    "stop_token_ids": conv.stop_token_ids,
-                    "echo": False,
-                    'do_sample': False,
-                }
-                output_stream = generate_stream_func(            
-                    model,
-                    tokenizer,
-                    gen_params,
-                    device = args.device,
-                    context_len=context_len,
-                    judge_sent_end=args.judge_sent_end,)
-                            
-                outputs = stream_output(output_stream)
+            # Generate prompt content
+            prompt_func = current_node.data[prompt_index]
+            prompt_input = prompt_func(
+                report_ = fn_inputs['report_'],
+                sentence_ = fn_inputs['sentence_'],
+                label_ = fn_inputs['label_']
+            )
 
-                conv.update_last_message(outputs.strip())
-        print(fn_inputs['id'], fn_inputs['organ'], conv, flush=True)
-        answer = current_node.parse_sentence(conv.messages[-1][-1], fn_inputs)
-        current_node = current_node[answer]
-        if type(answer)==list:
-            if return_conv:
-                return current_node, fn_inputs['conv']
+            if len(prompt_input) == 0:
+                # Use raw sentence as input if prompt function returns empty
+                prompt = fn_inputs['sentence_']
             else:
-                return current_node
+                prompt = prompt_input
+
+            # Optional: Include system message or chat header if needed
+            full_prompt = prompt
+
+            # Tokenize and run generation
+            inputs = tokenizer(full_prompt, return_tensors="pt").to(model.device)
+
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=current_node.max_new_tokens[prompt_index],
+                    do_sample=True,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+
+            decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            output_text = decoded[len(full_prompt):].strip()
+            chat_history.append((prompt, output_text))
+
+        # Debugging: show current report and model output
+        print(fn_inputs['id'], fn_inputs['organ'])
+        for prompt, reply in chat_history:
+            print(f">> Prompt:\n{prompt}\n>> Response:\n{reply}\n")
+
+        # Use the latest model response for parsing
+        final_response = chat_history[-1][1]
+        answer = current_node.parse_sentence(final_response, fn_inputs)
+
+        # Traverse to next node
+        current_node = current_node[answer]
+
+        # Recursive return if needed
+        if isinstance(answer, list):
+            return (current_node, chat_history) if return_conv else current_node
         if return_conv:
             if 'conv' in fn_inputs:
-                fn_inputs['conv'] = fn_inputs['conv'] + conv
+                fn_inputs['conv'] += chat_history
             else:
-                fn_inputs['conv'] = conv
-        return get_node_output(current_node, fn_inputs, tokenizer, model, model_name, do_tasks, args)
+                fn_inputs['conv'] = chat_history
+        return get_node_output(current_node, fn_inputs, tokenizer, model, model_name, do_tasks, args, return_conv)
+
     else:
-        if return_conv:
-            return current_node, fn_inputs['conv']
-        else:
-            return current_node
+        return (current_node, fn_inputs.get('conv', [])) if return_conv else current_node
+
 
 async def get_full_answer(request_outputs):
     to_return = []
@@ -241,98 +229,125 @@ async def get_full_answer(request_outputs):
     return to_return
 
 #run asynchronous function to generate a model output from the loop that is running on the background
-def generate(prompt, sampling_params, engine):
-    from vllm.utils import random_uuid 
-    import asyncio
-    request_id = random_uuid()
-    assert engine is not None
+def generate(prompt, sampling_params, model, tokenizer):
+    import torch
+
+    # Tokenize input prompt
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    # Prepare generation arguments
+    generate_kwargs = {
+        "max_new_tokens": sampling_params.get("max_new_tokens", 256),
+        "temperature": sampling_params.get("temperature", 0.7),
+        "top_p": sampling_params.get("top_p", 0.9),
+        "do_sample": True,
+        "repetition_penalty": sampling_params.get("repetition_penalty", 1.0),
+        "pad_token_id": tokenizer.eos_token_id,
+    }
+
+    # Generate response
+    with torch.no_grad():
+        output_ids = model.generate(**inputs, **generate_kwargs)
+
+    # Decode and return generated text (after prompt)
+    decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     
-    loop =  engine._background_loop_unshielded.get_loop()
-    a = engine.generate(prompt, sampling_params, str(request_id))
-    request_outputs = asyncio.run_coroutine_threadsafe(get_full_answer(a), loop)
-    request_outputs = request_outputs.result()
-    return request_outputs
+    # Ensure we only return new content
+    if decoded.startswith(prompt):
+        generated_text = decoded[len(prompt):].strip()
+    else:
+        generated_text = decoded.strip()
+
+    return generated_text
 
 def get_node_output_vllm(current_node, fn_inputs, tokenizer, model, model_name, do_tasks, args, return_conv=False):
-    import importlib.util
-    import sys
-    module_name = 'vllm'
-
-    if module_name in sys.modules:
-        module = sys.modules[module_name]
-    else:
-        # Use importlib.util.find_spec to locate the module
-        spec = importlib.util.find_spec(module_name)
-        if spec is None:
-            raise ImportError(f"Module {module_name} not found")
-
-        # Load the module from the found specification
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+    import torch
 
     repetition_penalty = args.repetition_penalty
 
-    if type(current_node)==list:
-        return [get_node_output_vllm(current_node[node_index], fn_inputs, tokenizer, model, model_name, do_tasks, args) if do_tasks[node_index] else -1 for node_index in range(len(current_node)) ]
-    if type(current_node)==Node:
+    if isinstance(current_node, list):
+        return [
+            get_node_output_vllm(current_node[node_index], fn_inputs, tokenizer, model, model_name, do_tasks, args)
+            if do_tasks[node_index] else -1
+            for node_index in range(len(current_node))
+        ]
+
+    if isinstance(current_node, Node):
+        # Init chat
         if 'conv_input' in fn_inputs:
             messages = fn_inputs['conv_input']
         else:
-            system_message="A chat between a radiologist and an artificial intelligence assistant trained to understand radiology reports and any synonyms and word equivalency of findings and medical terms that may appear in the report. The assistant gives helpful structured answers to the radiologist."
-            messages = []
-            messages.append({"role":"system","content":system_message})
+            messages = [{"role": "system", "content": (
+                "A chat between a radiologist and an artificial intelligence assistant trained to understand radiology "
+                "reports and any synonyms and word equivalency of findings and medical terms that may appear in the "
+                "report. The assistant gives helpful structured answers to the radiologist."
+            )}]
+
         for prompt_index in range(len(current_node.data)):
-            
-            inp =f"{current_node.data[prompt_index](report_ = fn_inputs['report_'], sentence_ = fn_inputs['sentence_'], label_ = fn_inputs['label_'])}"
+            # Build prompt from node
+            inp = current_node.data[prompt_index](
+                report_=fn_inputs['report_'],
+                sentence_=fn_inputs['sentence_'],
+                label_=fn_inputs['label_']
+            )
 
-            if len(inp)==0:
+            if len(inp) == 0:
                 messages.append({"role": "assistant", "content": fn_inputs['sentence_']})
+                continue
+
+            messages.append({"role": "user", "content": inp})
+
+            # Apply chat template (non-tokenized version is used for decoding)
+            prompt_text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+
+            # Tokenize input
+            inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+
+            # Generate
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=current_node.max_new_tokens[prompt_index],
+                    do_sample=True,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    repetition_penalty=repetition_penalty,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+
+            decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+            # Safely strip prompt
+            if decoded.startswith(prompt_text):
+                output_text = decoded[len(prompt_text):].strip()
             else:
+                output_text = decoded.strip()
 
-                messages.append({"role": "user", "content": inp})
-                prompt =  tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
-                assert(len(prompt)<=8192*2)
-                
-                prompt =  tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                
-                # assert(args.temperature==0)
-                if args.top_k is not None:
-                    sampling_params = module.SamplingParams(temperature=args.temperature, 
-                                                            repetition_penalty = repetition_penalty, top_k = args.top_k,
-                                                            max_tokens = current_node.max_new_tokens[prompt_index],
-                                                            skip_special_tokens = False)
-                else:
-                    sampling_params = module.SamplingParams(temperature=args.temperature, 
-                                                            repetition_penalty = repetition_penalty,
-                                                            max_tokens = current_node.max_new_tokens[prompt_index],
-                                                            skip_special_tokens = False)
-                
-                outputs = generate(prompt, sampling_params, model) 
-                
-                outputs = outputs.outputs[0].text
+            messages.append({"role": "assistant", "content": output_text})
 
-                messages.append({"role": "assistant", "content": outputs.strip()})
         print(fn_inputs['id'], fn_inputs['organ'], messages, flush=True)
+
+        # Parse final response
         answer = current_node.parse_sentence(messages[-1]['content'], fn_inputs)
         print(answer, flush=True)
+
         current_node = current_node[answer]
+
+        # Conversation persistence
         if return_conv:
-            if 'conv' in fn_inputs:
-                fn_inputs['conv'] = fn_inputs['conv'] + messages
-            else:
-                fn_inputs['conv'] = messages
-        if type(answer)==list:
-            if return_conv:
-                return current_node, fn_inputs['conv']
-            else:
-                return current_node
-        return get_node_output_vllm(current_node, fn_inputs, tokenizer, model, model_name, do_tasks, args)
+            fn_inputs['conv'] = fn_inputs.get('conv', []) + messages
+
+        if isinstance(answer, list):
+            return (current_node, fn_inputs['conv']) if return_conv else current_node
+
+        return get_node_output_vllm(current_node, fn_inputs, tokenizer, model, model_name, do_tasks, args, return_conv)
+
     else:
-        if return_conv:
-            return current_node, fn_inputs['conv']
-        else:
-            return current_node
+        return (current_node, fn_inputs.get('conv', [])) if return_conv else current_node
 
 def get_prompt_tree_maplez(short_answers, include_report_in_final_prompt, cot_for_uncertain, get_node_output_fn, heart_labels, label_set_mimic_complex, label_set_mimic_generic):
     assert(not include_report_in_final_prompt)
