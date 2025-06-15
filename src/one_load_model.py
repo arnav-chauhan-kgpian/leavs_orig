@@ -230,131 +230,29 @@ if __name__ == "__main__":
     os.environ["HF_HOME"] = download_location
     os.environ["TRANSFORMERS_CACHE"] = download_location
     os.environ["HF_DATASETS_CACHE"] = download_location
-    if not args.use_vllm:
-        
+    from transformers import AutoTokenizer, AutoModelForCausalLM
 
-        from fastchat.modules.awq import AWQConfig
-        from fastchat.modules.gptq import GptqConfig
-        from fastchat.modules.exllama import ExllamaConfig
-        from fastchat.modules.xfastertransformer import XftConfig
-        
-        from fastchat.utils import str_to_torch_dtype
-        from fastchat.model.model_adapter import load_model
+    print(f"Loading Hugging Face model from {args.model_path} ...")
 
-        if args.device == "cuda":
-            kwargs = {"torch_dtype": torch.float16}
-            if num_gpus == "auto":
-                kwargs["device_map"] = "auto"
-            else:
-                num_gpus = int(num_gpus)
-                if num_gpus != 1:
-                    kwargs.update({
-                        "device_map": "auto",
-                        "max_memory": {i: f"{159.5/num_gpus}GiB" for i in range(num_gpus)},
-                    })
-        elif args.device == "cpu":
-            kwargs = {}
-        else:
-            raise ValueError(f"Invalid device: {args.device}")
-        
-        gptq_config=GptqConfig(
-                    ckpt=args.gptq_ckpt or args.model_path,
-                    wbits=args.gptq_wbits,
-                    groupsize=args.gptq_groupsize,
-                    act_order=args.gptq_act_order,
-                )
-        
-        awq_config=AWQConfig(
-                    ckpt=args.awq_ckpt or args.model_path,
-                    wbits=args.awq_wbits,
-                    groupsize=args.awq_groupsize,
-                )
-        
-        if args.enable_exllama:
-            exllama_config = ExllamaConfig(
-                max_seq_len=args.exllama_max_seq_len,
-                gpu_split=args.exllama_gpu_split,
-                cache_8bit=args.exllama_cache_8bit,
-            )
-        else:
-            exllama_config = None
-        if args.enable_xft:
-            xft_config = XftConfig(
-                max_seq_len=args.xft_max_seq_len,
-                data_type=args.xft_dtype,
-            )
-            if args.device != "cpu":
-                print("xFasterTransformer now is only support CPUs. Reset device to CPU")
-                args.device = "cpu"
-        else:
-            xft_config = None
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    # Select device and dtype
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    dtype = torch.float16 if "cuda" in args.device and args.dtype != "float32" else torch.float32
 
-        model, tokenizer = load_model(
-            args.model_path,
-            device=args.device,
-            num_gpus=num_gpus,
-            max_gpu_memory=args.max_gpu_memory,
-            dtype=str_to_torch_dtype(args.dtype),
-            load_8bit=args.load_8bit,
-            cpu_offloading=args.cpu_offloading,
-            gptq_config=gptq_config,
-            awq_config=awq_config,
-            exllama_config=exllama_config,
-            xft_config=xft_config,
-            revision=args.revision,
-            debug=False,
-        )
+    # Load model
+    model = AutoModelForCausalLM.from_pretrained(
+    args.model_path,
+    revision=args.revision,
+    torch_dtype=dtype,
+    device_map="auto" if args.num_gpus != 1 else None,
+    trust_remote_code=True
+    )
 
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    model.eval()
 
-        if args.device == "cuda" and num_gpus == 1:
-            model.cuda()
-    else:
-        from transformers import AutoTokenizer
-        import importlib.util
-        import sys
-        module_name = 'vllm'
-
-        if module_name in sys.modules:
-            module = sys.modules[module_name]
-        else:
-            # Use importlib.util.find_spec to locate the module
-            spec = importlib.util.find_spec(module_name)
-            if spec is None:
-                raise ImportError(f"Module {module_name} not found")
-
-            # Load the module from the found specification
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
-            spec.loader.exec_module(module)
-        from vllm.engine.async_llm_engine import AsyncLLMEngine
-        from vllm.engine.arg_utils import AsyncEngineArgs
-        from vllm.usage.usage_lib import UsageContext
-        engine_args = AsyncEngineArgs(
-                model=args.model_path,
-                tensor_parallel_size=num_gpus, 
-                gpu_memory_utilization=0.95, 
-                max_model_len=4096*args.length_multiplier, 
-                disable_log_requests=True, 
-                disable_log_stats = True,
-                dtype = 'float16',
-            )
-        model = AsyncLLMEngine.from_engine_args(engine_args = engine_args, usage_context = UsageContext.LLM_CLASS)
-        if not model.is_running:
-            #start loop that is running the vllm model on the background
-            import asyncio
-            import threading
-            model.start_background_loop()
-            loop =  model._background_loop_unshielded.get_loop()
-            asyncio.set_event_loop(loop)
-            import nest_asyncio
-            nest_asyncio.apply(loop)
-            def run_event_loop():
-                loop.run_forever()
-            loop_thread = threading.Thread(target=run_event_loop)
-            loop_thread.start()
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     import gc
     gc.collect()
     torch.cuda.empty_cache()
@@ -383,12 +281,4 @@ if __name__ == "__main__":
                 reloaded = True
             except Exception as e: 
                 traceback.print_exception(*sys.exc_info())
-    if args.use_vllm:
-        #stop loop that is running the vllm model on the background
-        def stop_loop_after(loop):
-            loop.call_soon_threadsafe(loop.stop)
-        stop_thread = threading.Thread(target=stop_loop_after, args=(loop,))
-        stop_thread.start()
-        stop_thread.join()
-        loop_thread.join()
-        loop.close()
+    
